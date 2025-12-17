@@ -3,6 +3,8 @@ from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from flask_cors import CORS
 import os
+from datetime import datetime, time
+from sqlalchemy import func
 
 app = Flask(__name__)
 CORS(app)
@@ -168,8 +170,8 @@ def login():
                 'diseases': patient.diseases
             }
         }), 200
+# -------------Apppintment routees
 
-# ==================== Appointment Routes ====================
 
 @app.route('/api/appointments', methods=['GET'])
 def get_appointments():
@@ -177,142 +179,151 @@ def get_appointments():
     patient_id = request.args.get('patient_id', type=int)
     doctor_id = request.args.get('doctor_id', type=int)
     status = request.args.get('status')
-    
+
     query = Appointment.query
-    
+
     if patient_id:
         query = query.filter_by(patient_id=patient_id)
     if doctor_id:
         query = query.filter_by(doctor_id=doctor_id)
     if status:
         query = query.filter_by(status=status)
-    
-    appointments = query.all()
-    
-    return jsonify([{
-        'id': apt.id,
-        'patient_name': apt.patient.name,
-        'doctor_name': apt.doctor.name,
-        'appointment_date': apt.appointment_date.isoformat(),
-        'reason': apt.reason,
-        'symptoms': apt.symptoms,
-        'status': apt.status,
-        'created_at': apt.created_at.isoformat()
-    } for apt in appointments]), 200
 
+    appointments = query.all()
+
+    return jsonify([
+        {
+            'id': apt.id,
+            'patient_name': apt.patient.name,
+            'doctor_name': apt.doctor.name,
+            'appointment_date': apt.appointment_date.isoformat(),
+            'reason': apt.reason,
+            'symptoms': apt.symptoms,
+            'status': apt.status,
+            'created_at': apt.created_at.isoformat()
+        }
+        for apt in appointments
+    ]), 200
 @app.route('/api/appointments/<int:id>', methods=['GET'])
-def get_appointment(id):
-    """Get single appointment details"""
+def get_appointment_by_id(id):
     apt = Appointment.query.get_or_404(id)
-    
+
     return jsonify({
         'id': apt.id,
         'patient_id': apt.patient_id,
-        'patient_name': apt.patient.name,
         'doctor_id': apt.doctor_id,
         'doctor_name': apt.doctor.name,
         'appointment_date': apt.appointment_date.isoformat(),
-        'reason': apt.reason,
-        'symptoms': apt.symptoms,
-        'status': apt.status,
-        'created_at': apt.created_at.isoformat(),
-        'notes': {
-            'diagnosis': apt.notes.diagnosis,
-            'treatment': apt.notes.treatment,
-            'prescription': apt.notes.prescription,
-            'notes': apt.notes.notes
-        } if apt.notes else None
+        'status': apt.status
     }), 200
 
+
+
+# =========================
+# AVAILABLE SLOTS
+# =========================
+@app.route('/api/appointments/available-slots', methods=['GET'])
+def get_available_slots():
+    doctor_id = request.args.get('doctor_id', type=int)
+    date = request.args.get('date')  # YYYY-MM-DD
+
+    if not doctor_id or not date:
+        return jsonify({'success': False, 'error': 'doctor_id and date are required'}), 400
+
+    try:
+        target_date = datetime.strptime(date, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Invalid date format'}), 400
+
+    booked = Appointment.query.filter(
+        Appointment.doctor_id == doctor_id,
+        func.date(Appointment.appointment_date) == target_date,
+        Appointment.status == 'scheduled'
+    ).all()
+
+    booked_times = {apt.appointment_date.strftime('%H:%M') for apt in booked}
+
+    all_slots = [time(hour, 30) for hour in range(14, 18)]  # 2 PM → 5 PM
+    available_slots = [slot.strftime('%H:%M') for slot in all_slots if slot.strftime('%H:%M') not in booked_times]
+
+    return jsonify({'success': True, 'available_slots': available_slots}), 200
+
+
+# =========================
+# BOOK APPOINTMENT
+# =========================
 @app.route('/api/appointments', methods=['POST'])
 def book_appointment():
-    """Book new appointment"""
     data = request.get_json()
-    
-    # Validate required fields
-    if not all(k in data for k in ['patient_id', 'doctor_id', 'appointment_date']):
-        return jsonify({'error': 'Missing required fields'}), 400
-    
-    # Parse appointment date
+    if not all(k in data for k in ['patient_id','doctor_id','appointment_date']):
+        return jsonify({'error':'Missing required fields'}), 400
+
     try:
-        appointment_date = datetime.fromisoformat(data['appointment_date'].replace('Z', '+00:00'))
+        appointment_date = datetime.fromisoformat(data['appointment_date'])
     except ValueError:
-        return jsonify({'error': 'Invalid date format. Use ISO 8601'}), 400
-    
-    # Check if time slot is available
-    existing = Appointment.query.filter_by(
-        doctor_id=data['doctor_id'],
-        appointment_date=appointment_date,
-        status='scheduled'
+        return jsonify({'error':'Invalid date format'}), 400
+
+    # التحقق من وجود موعد مسبق
+    existing = Appointment.query.filter(
+        Appointment.doctor_id==data['doctor_id'],
+        Appointment.appointment_date==appointment_date,
+        Appointment.status=='scheduled'
     ).first()
-    
     if existing:
-        return jsonify({'error': 'Time slot already booked. Please choose another slot.'}), 409
-    
-    # Create appointment
-    appointment = Appointment(
+        return jsonify({'error':'Time slot already booked'}), 409
+
+    # إنشاء الموعد
+    apt = Appointment(
         patient_id=data['patient_id'],
         doctor_id=data['doctor_id'],
         appointment_date=appointment_date,
-        reason=data.get('reason', ''),
-        symptoms=data.get('symptoms', ''),
         status='scheduled'
     )
-    
-    db.session.add(appointment)
+    db.session.add(apt)
     db.session.commit()
-    
-    return jsonify({
-        'message': 'Appointment booked successfully',
-        'appointment': {
-            'id': appointment.id,
-            'patient_name': appointment.patient.name,
-            'doctor_name': appointment.doctor.name,
-            'appointment_date': appointment.appointment_date.isoformat(),
-            'status': appointment.status
-        }
-    }), 201
 
+    return jsonify({'message':'Appointment booked successfully'}), 201
+
+# =========================
+# EDIT APPOINTMENT
+# =========================
 @app.route('/api/appointments/<int:id>', methods=['PUT'])
 def edit_appointment(id):
     """Edit existing appointment"""
     apt = Appointment.query.get_or_404(id)
     data = request.get_json()
-    
-    # Check if appointment can be edited
+
     if apt.status == 'completed':
         return jsonify({'error': 'Cannot edit completed appointment'}), 400
-    
-    # Update appointment date if provided
+
     if 'appointment_date' in data:
         try:
-            new_date = datetime.fromisoformat(data['appointment_date'].replace('Z', '+00:00'))
-            
-            # Check if new time slot is available
+            new_date = datetime.fromisoformat(data['appointment_date'])
+
+            # تحقق من عدم تكرار الموعد لنفس الطبيب
             existing = Appointment.query.filter(
                 Appointment.id != id,
                 Appointment.doctor_id == apt.doctor_id,
                 Appointment.appointment_date == new_date,
                 Appointment.status == 'scheduled'
             ).first()
-            
+
             if existing:
                 return jsonify({'error': 'New time slot is not available'}), 409
-            
+
             apt.appointment_date = new_date
         except ValueError:
             return jsonify({'error': 'Invalid date format'}), 400
-    
-    # Update other fields
+
     if 'reason' in data:
         apt.reason = data['reason']
     if 'symptoms' in data:
         apt.symptoms = data['symptoms']
     if 'status' in data:
         apt.status = data['status']
-    
+
     db.session.commit()
-    
+
     return jsonify({
         'message': 'Appointment updated successfully',
         'appointment': {
@@ -324,52 +335,25 @@ def edit_appointment(id):
         }
     }), 200
 
+
+# =========================
+# CANCEL APPOINTMENT
+# =========================
 @app.route('/api/appointments/<int:id>', methods=['DELETE'])
 def cancel_appointment(id):
     """Cancel appointment"""
     apt = Appointment.query.get_or_404(id)
-    
+
     if apt.status == 'completed':
         return jsonify({'error': 'Cannot cancel completed appointment'}), 400
-    
+
     apt.status = 'cancelled'
     db.session.commit()
-    
+
     return jsonify({'message': 'Appointment cancelled successfully'}), 200
 
-@app.route('/api/appointments/available-slots', methods=['GET'])
-def get_available_slots():
-    """Get available time slots for a doctor"""
-    doctor_id = request.args.get('doctor_id', type=int)
-    date = request.args.get('date')  # YYYY-MM-DD
-    
-    if not doctor_id or not date:
-        return jsonify({'error': 'doctor_id and date are required'}), 400
-    
-    try:
-        target_date = datetime.strptime(date, '%Y-%m-%d').date()
-    except ValueError:
-        return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
-    
-    # Get booked appointments for that day
-    booked = Appointment.query.filter(
-        Appointment.doctor_id == doctor_id,
-        db.func.date(Appointment.appointment_date) == target_date,
-        Appointment.status == 'scheduled'
-    ).all()
-    
-    booked_times = [apt.appointment_date.time() for apt in booked]
-    
-    # Generate available slots (9 AM - 5 PM, hourly)
-    from datetime import time
-    all_slots = [time(hour=h) for h in range(9, 17)]
-    available_slots = [slot for slot in all_slots if slot not in booked_times]
-    
-    return jsonify({
-        'date': date,
-        'doctor_id': doctor_id,
-        'available_slots': [slot.strftime('%H:%M') for slot in available_slots]
-    }), 200
+
+
 
 # ==================== Doctor Notes Routes ====================
 
@@ -459,8 +443,8 @@ def get_doctor_notes(id):
     }), 200
 
 # ==================== Medical History Routes ====================
-
-@app.route('/api/patients/<int:id>/history', methods=['GET'])
+ 
+@app.route('/api/patients/<int:id>/history', methods=['GET'] )
 def get_medical_history(id):
     """Get patient medical history"""
     patient = Patient.query.get_or_404(id)
